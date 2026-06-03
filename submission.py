@@ -71,8 +71,8 @@ if SUBMIT:
                 f"{BASE_URL}/submit/{TASK_ID}",
                 headers={"X-API-Key": API_KEY},
                 files=files,
-                data={"model-name": MODEL_NAME},
-                timeout=(10, 120),
+                data={"model_name": MODEL_NAME},
+                timeout=(10, 1000),
             )
 
         try:
