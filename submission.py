@@ -53,6 +53,7 @@ MODEL_NAME = "resnet18"  # replace with your actual model architecture - resnet1
 
 SUBMIT = True  # set to True to enable submission
 
+TASK_ID = "03-robustness" # donot change
 
 def die(msg):
     print(f"{msg}", file=sys.stderr)
@@ -67,7 +68,7 @@ if SUBMIT:
         with open(MODEL_PATH, "rb") as f:
             files = {"file": (os.path.basename(MODEL_PATH), f, "application/x-pytorch")}
             resp = requests.post(
-                f"{BASE_URL}/robustness",
+                f"{BASE_URL}/submit/{TASK_ID}",
                 headers={"X-API-Key": API_KEY},
                 files=files,
                 data={"model-name": MODEL_NAME},
