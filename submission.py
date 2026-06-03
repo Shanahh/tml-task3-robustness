@@ -55,6 +55,7 @@ SUBMIT = True  # set to True to enable submission
 
 TASK_ID = "03-robustness" # donot change
 
+
 def die(msg):
     print(f"{msg}", file=sys.stderr)
     sys.exit(1)
@@ -72,7 +73,7 @@ if SUBMIT:
                 headers={"X-API-Key": API_KEY},
                 files=files,
                 data={"model_name": MODEL_NAME},
-                timeout=(10, 1000),
+                # timeout=(10, 520),
             )
 
         try:
