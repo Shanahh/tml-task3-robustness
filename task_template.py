@@ -47,14 +47,6 @@ def build_model(arch: str):
 
     model = constructors[arch](weights=None)
 
-    # Important for 32x32 images:
-    # vanilla ImageNet ResNet starts with 7x7 stride-2 conv + maxpool, which is bad for CIFAR-size images.
-    # This modification keeps the architecture as torchvision ResNet but makes it CIFAR-compatible.
-    model.conv1 = nn.Conv2d(
-        3, 64, kernel_size=3, stride=1, padding=1, bias=False
-    )
-    model.maxpool = nn.Identity()
-
     model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
 
     return model
@@ -553,8 +545,12 @@ def main():
 
         if clean_acc > 0.50 and score_proxy > best_score_proxy:
             best_score_proxy = score_proxy
-            best_state = copy.deepcopy(eval_model.backbone.state_dict())
-            torch.save(best_state, args.out)
+
+            if ema is not None:
+                state = copy.deepcopy(ema.shadow.backbone.state_dict())
+            else:
+                state = copy.deepcopy(model.backbone.state_dict())
+            torch.save(state, args.out)
             print(f"Saved best checkpoint to {args.out}")
 
     if best_state is None:

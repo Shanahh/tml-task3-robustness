@@ -1,1 +1,4 @@
 train.npz
+runlogs/
+*.sub
+model.pt
