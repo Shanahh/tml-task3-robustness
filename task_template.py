@@ -3,6 +3,7 @@ import copy
 import math
 import os
 import random
+import zipfile
 from dataclasses import dataclass
 
 import numpy as np
@@ -15,8 +16,6 @@ from torchvision.models import resnet18, resnet34, resnet50
 
 
 NUM_CLASSES = 9
-CIFAR_MEAN = torch.tensor([0.4914, 0.4822, 0.4465]).view(1, 3, 1, 1)
-CIFAR_STD = torch.tensor([0.2470, 0.2435, 0.2616]).view(1, 3, 1, 1)
 
 
 def seed_everything(seed: int):
@@ -26,14 +25,40 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 
-class Normalize(nn.Module):
-    def __init__(self, mean=CIFAR_MEAN, std=CIFAR_STD):
-        super().__init__()
-        self.register_buffer("mean", mean)
-        self.register_buffer("std", std)
+def load_npz_dataset(path: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset not found: {path}")
 
-    def forward(self, x):
-        return (x - self.mean) / self.std
+    print("Dataset path:", path)
+    print("Dataset size:", os.path.getsize(path), "bytes")
+
+    if not zipfile.is_zipfile(path):
+        with open(path, "rb") as f:
+            prefix = f.read(300)
+        raise ValueError(
+            "This is not a valid .npz archive. "
+            "You probably have a Git LFS pointer, HTML page, redirect file, or corrupted download.\n"
+            f"First bytes:\n{prefix!r}"
+        )
+
+    data = np.load(path, allow_pickle=False)
+
+    print("NPZ keys:", data.files)
+
+    if "images" not in data.files or "labels" not in data.files:
+        raise KeyError(f"Expected keys ['images', 'labels'], got {data.files}")
+
+    images = data["images"]
+    labels = data["labels"]
+
+    print("images:", images.shape, images.dtype, images.min(), images.max())
+    print("labels:", labels.shape, labels.dtype, labels.min(), labels.max())
+
+    assert images.ndim == 4 and images.shape[1:] == (3, 32, 32), images.shape
+    assert images.dtype == np.uint8, images.dtype
+    assert labels.min() >= 0 and labels.max() < NUM_CLASSES
+
+    return images, labels
 
 
 def build_model(arch: str):
@@ -42,74 +67,60 @@ def build_model(arch: str):
         "resnet34": resnet34,
         "resnet50": resnet50,
     }
+
     if arch not in constructors:
         raise ValueError(f"Unsupported architecture: {arch}")
 
     model = constructors[arch](weights=None)
-
     model.fc = nn.Linear(model.fc.in_features, NUM_CLASSES)
-
     return model
 
 
-class NormalizedModel(nn.Module):
-    def __init__(self, backbone):
-        super().__init__()
-        self.norm = Normalize()
-        self.backbone = backbone
-
-    def forward(self, x):
-        return self.backbone(self.norm(x))
-
-    def features(self, x):
-        # ResNet feature extractor before final fc.
-        x = self.norm(x)
-        m = self.backbone
-        x = m.conv1(x)
-        x = m.bn1(x)
-        x = m.relu(x)
-        x = m.maxpool(x)
-        x = m.layer1(x)
-        x = m.layer2(x)
-        x = m.layer3(x)
-        x = m.layer4(x)
-        x = m.avgpool(x)
-        x = torch.flatten(x, 1)
-        return x
+def resnet_features(model, x):
+    # Latent representation before the final fc layer.
+    x = model.conv1(x)
+    x = model.bn1(x)
+    x = model.relu(x)
+    x = model.maxpool(x)
+    x = model.layer1(x)
+    x = model.layer2(x)
+    x = model.layer3(x)
+    x = model.layer4(x)
+    x = model.avgpool(x)
+    x = torch.flatten(x, 1)
+    return x
 
 
 def random_crop_flip(x, padding=4):
-    # x: BCHW in [0,1]
+    # x: BCHW in [0, 1]
     b, c, h, w = x.shape
 
-    # horizontal flip
     flip = torch.rand(b, device=x.device) < 0.5
     x = x.clone()
     x[flip] = torch.flip(x[flip], dims=[3])
 
-    # pad and random crop
     x_pad = F.pad(x, (padding, padding, padding, padding), mode="reflect")
     out = torch.empty_like(x)
+
     for i in range(b):
         top = torch.randint(0, 2 * padding + 1, (1,), device=x.device).item()
         left = torch.randint(0, 2 * padding + 1, (1,), device=x.device).item()
         out[i] = x_pad[i, :, top:top + h, left:left + w]
+
     return out
 
 
-def cutmix_or_mixup(x, y, num_classes, p=0.5, alpha=1.0):
+def cutmix_or_mixup(x, y, p=0.5, alpha=1.0):
     if torch.rand(1).item() > p:
-        return x, y, None, 1.0, "none"
+        return x, y, None, 1.0
 
     lam = np.random.beta(alpha, alpha)
     idx = torch.randperm(x.size(0), device=x.device)
 
     if torch.rand(1).item() < 0.5:
-        # MixUp
         mixed_x = lam * x + (1.0 - lam) * x[idx]
-        return mixed_x, y, y[idx], lam, "mixup"
+        return mixed_x, y, y[idx], lam
 
-    # CutMix
     b, c, h, w = x.shape
     cut_rat = math.sqrt(1.0 - lam)
     cut_w = int(w * cut_rat)
@@ -127,12 +138,13 @@ def cutmix_or_mixup(x, y, num_classes, p=0.5, alpha=1.0):
     mixed_x[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
 
     lam = 1.0 - ((x2 - x1) * (y2 - y1) / (w * h))
-    return mixed_x, y, y[idx], lam, "cutmix"
+    return mixed_x, y, y[idx], lam
 
 
 def mixed_ce_loss(logits, y_a, y_b=None, lam=1.0):
     if y_b is None:
         return F.cross_entropy(logits, y_a, label_smoothing=0.05)
+
     return (
         lam * F.cross_entropy(logits, y_a, label_smoothing=0.05)
         + (1.0 - lam) * F.cross_entropy(logits, y_b, label_smoothing=0.05)
@@ -145,6 +157,7 @@ def clamp_linf(x_adv, x_nat, eps):
 
 
 def pgd_attack(model, x, y, eps, alpha, steps, random_start=True):
+    was_training = model.training
     model.eval()
 
     if random_start:
@@ -158,14 +171,18 @@ def pgd_attack(model, x, y, eps, alpha, steps, random_start=True):
         logits = model(x_adv)
         loss = F.cross_entropy(logits, y)
         grad = torch.autograd.grad(loss, x_adv, only_inputs=True)[0]
+
         x_adv = x_adv.detach() + alpha * grad.sign()
         x_adv = clamp_linf(x_adv, x, eps)
 
-    model.train()
+    if was_training:
+        model.train()
+
     return x_adv.detach()
 
 
 def trades_attack(model, x, eps, alpha, steps):
+    was_training = model.training
     model.eval()
 
     with torch.no_grad():
@@ -179,10 +196,13 @@ def trades_attack(model, x, eps, alpha, steps):
         log_p_adv = F.log_softmax(model(x_adv), dim=1)
         loss_kl = F.kl_div(log_p_adv, p_nat, reduction="batchmean")
         grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True)[0]
+
         x_adv = x_adv.detach() + alpha * grad.sign()
         x_adv = clamp_linf(x_adv, x, eps)
 
-    model.train()
+    if was_training:
+        model.train()
+
     return x_adv.detach()
 
 
@@ -198,27 +218,28 @@ def trades_loss(model, x, y, eps, alpha, steps, beta):
         F.softmax(logits_nat.detach(), dim=1),
         reduction="batchmean",
     )
+
     return loss_nat + beta * loss_rob, logits_nat, x_adv
 
 
 def supervised_contrastive_loss(features, labels, temperature=0.2):
-    # Supervised contrastive loss over clean+adversarial/noisy features.
     features = F.normalize(features, dim=1)
+
     logits = features @ features.T / temperature
+    logits = logits - logits.max(dim=1, keepdim=True)[0].detach()
 
     labels = labels.view(-1, 1)
     mask = torch.eq(labels, labels.T).float().to(features.device)
 
-    # remove self-comparisons
     logits_mask = torch.ones_like(mask) - torch.eye(mask.size(0), device=mask.device)
     mask = mask * logits_mask
 
-    logits = logits - logits.max(dim=1, keepdim=True)[0].detach()
     exp_logits = torch.exp(logits) * logits_mask
     log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
 
     positives = mask.sum(dim=1)
     valid = positives > 0
+
     if valid.sum() == 0:
         return torch.tensor(0.0, device=features.device)
 
@@ -238,27 +259,32 @@ class EMA:
 
     @torch.no_grad()
     def update(self):
-        msd = self.model.state_dict()
-        ssd = self.shadow.state_dict()
-        for k in ssd.keys():
-            if ssd[k].dtype.is_floating_point:
-                ssd[k].mul_(self.decay).add_(msd[k], alpha=1.0 - self.decay)
+        model_state = self.model.state_dict()
+        shadow_state = self.shadow.state_dict()
+
+        for k in shadow_state.keys():
+            if shadow_state[k].dtype.is_floating_point:
+                shadow_state[k].mul_(self.decay).add_(model_state[k], alpha=1.0 - self.decay)
             else:
-                ssd[k].copy_(msd[k])
+                shadow_state[k].copy_(model_state[k])
 
 
 @torch.no_grad()
 def accuracy(model, loader, device, noise_std=0.0):
     model.eval()
+
     correct = 0
     total = 0
 
     for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
         if noise_std > 0:
             x = (x + noise_std * torch.randn_like(x)).clamp(0.0, 1.0)
+
         pred = model(x).argmax(dim=1)
+
         correct += (pred == y).sum().item()
         total += y.numel()
 
@@ -267,28 +293,43 @@ def accuracy(model, loader, device, noise_std=0.0):
 
 def robust_accuracy_pgd(model, loader, device, eps, alpha, steps, max_batches=20):
     model.eval()
+
     correct = 0
     total = 0
 
-    for bi, (x, y) in enumerate(loader):
-        if bi >= max_batches:
+    for batch_idx, (x, y) in enumerate(loader):
+        if batch_idx >= max_batches:
             break
-        x = x.to(device)
-        y = y.to(device)
+
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
         x_adv = pgd_attack(model, x, y, eps, alpha, steps, random_start=True)
+
         with torch.no_grad():
             pred = model(x_adv).argmax(dim=1)
+
         correct += (pred == y).sum().item()
         total += y.numel()
 
     return correct / max(total, 1)
 
 
+def save_checkpoint(path, state):
+    torch.save(state, path)
+
+    loaded = torch.load(path, map_location="cpu")
+    if not isinstance(loaded, dict):
+        raise RuntimeError("Saved file is not a state dict.")
+
+    print(f"Saved checkpoint: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
+
     parser.add_argument("--data", type=str, default="train.npz")
-    parser.add_argument("--arch", type=str, default="resnet18",
-                        choices=["resnet18", "resnet34", "resnet50"])
+    parser.add_argument("--arch", type=str, default="resnet18", choices=["resnet18", "resnet34", "resnet50"])
     parser.add_argument("--out", type=str, default="model.pt")
 
     parser.add_argument("--epochs", type=int, default=120)
@@ -299,40 +340,38 @@ def main():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--workers", type=int, default=4)
 
-    parser.add_argument("--method", type=str, default="trades",
-                        choices=["clean", "pgd", "trades", "fast"])
+    parser.add_argument("--method", type=str, default="trades", choices=["clean", "pgd", "trades", "fast"])
     parser.add_argument("--eps", type=float, default=8 / 255)
     parser.add_argument("--alpha", type=float, default=2 / 255)
     parser.add_argument("--pgd-steps", type=int, default=7)
     parser.add_argument("--beta", type=float, default=6.0)
 
-    parser.add_argument("--noise-std", type=float, default=0.03,
-                        help="Gaussian noise training. This approximates randomized smoothing during training.")
-    parser.add_argument("--supcon-weight", type=float, default=0.05,
-                        help="Auxiliary supervised adversarial contrastive loss.")
-    parser.add_argument("--mix-p", type=float, default=0.25,
-                        help="Probability of MixUp/CutMix on clean warmup only.")
+    parser.add_argument("--noise-std", type=float, default=0.03)
+    parser.add_argument("--supcon-weight", type=float, default=0.05)
+    parser.add_argument("--mix-p", type=float, default=0.25)
     parser.add_argument("--warmup-epochs", type=int, default=10)
 
     parser.add_argument("--ema", action="store_true")
     parser.add_argument("--ema-decay", type=float, default=0.999)
+
     parser.add_argument("--amp", action="store_true")
+
     args = parser.parse_args()
 
     seed_everything(args.seed)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    data = np.load(args.data)
-    images = torch.from_numpy(data["images"]).float() / 255.0
-    labels = torch.from_numpy(data["labels"]).long()
+    images_np, labels_np = load_npz_dataset(args.data)
 
-    assert images.ndim == 4 and images.shape[1:] == (3, 32, 32)
-    assert labels.min().item() >= 0 and labels.max().item() < NUM_CLASSES
+    images = torch.from_numpy(images_np).float() / 255.0
+    labels = torch.from_numpy(labels_np).long()
 
     dataset = TensorDataset(images, labels)
 
     val_size = args.val_split
     train_size = len(dataset) - val_size
+
     train_set, val_set = random_split(
         dataset,
         [train_size, val_size],
@@ -347,6 +386,7 @@ def main():
         pin_memory=True,
         drop_last=True,
     )
+
     val_loader = DataLoader(
         val_set,
         batch_size=args.batch_size,
@@ -355,8 +395,7 @@ def main():
         pin_memory=True,
     )
 
-    backbone = build_model(args.arch)
-    model = NormalizedModel(backbone).to(device)
+    model = build_model(args.arch).to(device)
 
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -377,13 +416,18 @@ def main():
 
     best_score_proxy = -1.0
     best_state = None
+    best_clean = 0.0
+    best_pgd = 0.0
 
     print(f"Device: {device}")
-    print(f"Train size: {train_size}, Val size: {val_size}")
-    print(f"Arch: {args.arch}, Method: {args.method}")
+    print(f"Train size: {train_size}")
+    print(f"Val size: {val_size}")
+    print(f"Arch: {args.arch}")
+    print(f"Method: {args.method}")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+
         running_loss = 0.0
         running_acc = 0.0
         seen = 0
@@ -394,17 +438,21 @@ def main():
 
             x = random_crop_flip(x)
 
-            # Warmup: clean training with MixUp/CutMix helps avoid early robust overfitting.
             use_clean_warmup = epoch <= args.warmup_epochs
 
             if use_clean_warmup:
-                x_train, y_a, y_b, lam, _ = cutmix_or_mixup(
-                    x, y, NUM_CLASSES, p=args.mix_p, alpha=1.0
+                x_train, y_a, y_b, lam = cutmix_or_mixup(
+                    x,
+                    y,
+                    p=args.mix_p,
+                    alpha=1.0,
                 )
+
                 if args.noise_std > 0:
                     x_train = (x_train + args.noise_std * torch.randn_like(x_train)).clamp(0.0, 1.0)
 
                 optimizer.zero_grad(set_to_none=True)
+
                 with autocast(enabled=args.amp):
                     logits = model(x_train)
                     loss = mixed_ce_loss(logits, y_a, y_b, lam)
@@ -421,6 +469,7 @@ def main():
 
                 if args.method == "clean":
                     optimizer.zero_grad(set_to_none=True)
+
                     with autocast(enabled=args.amp):
                         logits = model(x_noisy)
                         loss = F.cross_entropy(logits, y, label_smoothing=0.05)
@@ -430,15 +479,18 @@ def main():
                     scaler.update()
 
                 elif args.method == "fast":
-                    # Fast adversarial training: random-start FGSM.
                     x_adv = pgd_attack(
-                        model, x_noisy, y,
+                        model,
+                        x_noisy,
+                        y,
                         eps=args.eps,
                         alpha=args.eps * 1.25,
                         steps=1,
                         random_start=True,
                     )
+
                     optimizer.zero_grad(set_to_none=True)
+
                     with autocast(enabled=args.amp):
                         logits = model(x_adv)
                         loss = F.cross_entropy(logits, y, label_smoothing=0.05)
@@ -449,7 +501,9 @@ def main():
 
                 elif args.method == "pgd":
                     x_adv = pgd_attack(
-                        model, x_noisy, y,
+                        model,
+                        x_noisy,
+                        y,
                         eps=args.eps,
                         alpha=args.alpha,
                         steps=args.pgd_steps,
@@ -457,6 +511,7 @@ def main():
                     )
 
                     optimizer.zero_grad(set_to_none=True)
+
                     with autocast(enabled=args.amp):
                         logits_clean = model(x_noisy)
                         logits_adv = model(x_adv)
@@ -467,8 +522,8 @@ def main():
                         )
 
                         if args.supcon_weight > 0:
-                            f_clean = model.features(x_noisy)
-                            f_adv = model.features(x_adv)
+                            f_clean = resnet_features(model, x_noisy)
+                            f_adv = resnet_features(model, x_adv)
                             f_all = torch.cat([f_clean, f_adv], dim=0)
                             y_all = torch.cat([y, y], dim=0)
                             loss = loss + args.supcon_weight * supervised_contrastive_loss(f_all, y_all)
@@ -479,8 +534,8 @@ def main():
 
                 elif args.method == "trades":
                     optimizer.zero_grad(set_to_none=True)
+
                     with autocast(enabled=False):
-                        # Attack generation should stay in fp32 for stable gradients.
                         loss_trades, logits, x_adv = trades_loss(
                             model,
                             x_noisy,
@@ -495,8 +550,8 @@ def main():
                         loss = loss_trades
 
                         if args.supcon_weight > 0:
-                            f_clean = model.features(x_noisy)
-                            f_adv = model.features(x_adv)
+                            f_clean = resnet_features(model, x_noisy)
+                            f_adv = resnet_features(model, x_adv)
                             f_all = torch.cat([f_clean, f_adv], dim=0)
                             y_all = torch.cat([y, y], dim=0)
                             loss = loss + args.supcon_weight * supervised_contrastive_loss(f_all, y_all)
@@ -517,6 +572,7 @@ def main():
         scheduler.step()
 
         eval_model = ema.shadow if ema is not None else model
+
         clean_acc = accuracy(eval_model, val_loader, device)
         smooth_acc = accuracy(eval_model, val_loader, device, noise_std=args.noise_std)
         pgd_acc = robust_accuracy_pgd(
@@ -529,7 +585,6 @@ def main():
             max_batches=20,
         )
 
-        # Proxy for the hidden score
         score_proxy = 0.5 * clean_acc + 0.5 * pgd_acc
 
         print(
@@ -545,31 +600,55 @@ def main():
 
         if clean_acc > 0.50 and score_proxy > best_score_proxy:
             best_score_proxy = score_proxy
+            best_clean = clean_acc
+            best_pgd = pgd_acc
 
-            if ema is not None:
-                state = copy.deepcopy(ema.shadow.backbone.state_dict())
-            else:
-                state = copy.deepcopy(model.backbone.state_dict())
+            state = copy.deepcopy(eval_model.state_dict())
             best_state = copy.deepcopy(state)
-            torch.save(state, args.out)
-            print(f"Saved best checkpoint to {args.out}")
+
+            save_checkpoint(args.out, best_state)
 
     if best_state is None:
-        print("WARNING: no checkpoint saved because clean validation accuracy never exceeded 50%.")
-        print("Try more epochs, lower eps for early training, or resnet34.")
-    else:
-        torch.save(best_state, args.out)
-        print(f"Final best proxy score: {best_score_proxy:.4f}")
-        print(f"Saved state_dict only: {args.out}")
+        raise RuntimeError(
+            "No checkpoint saved because clean validation accuracy never exceeded 50%. "
+            "Do not submit."
+        )
 
-    # Submission sanity check
-    test_backbone = build_model(args.arch)
-    test_backbone.load_state_dict(torch.load(args.out, map_location="cpu"))
-    test_backbone.eval()
+    save_checkpoint(args.out, best_state)
+
+    print(f"Best proxy score: {best_score_proxy:.4f}")
+    print(f"Best clean validation accuracy: {best_clean:.4f}")
+    print(f"Best PGD validation accuracy: {best_pgd:.4f}")
+
+    # Submission sanity check:
+    # This EXACTLY mirrors what the server is likely doing for model construction.
+    test_model = build_model(args.arch).to(device)
+    state = torch.load(args.out, map_location=device)
+
+    missing, unexpected = test_model.load_state_dict(state, strict=False)
+
+    print("Missing keys:", missing)
+    print("Unexpected keys:", unexpected)
+
+    assert len(missing) == 0, missing
+    assert len(unexpected) == 0, unexpected
+
+    test_model.eval()
+
     with torch.no_grad():
-        out = test_backbone(torch.randn(1, 3, 32, 32))
+        out = test_model(torch.randn(1, 3, 32, 32, device=device))
+
     assert out.shape == (1, NUM_CLASSES), out.shape
     print("Sanity check passed: output shape is", tuple(out.shape))
+
+    submitted_clean_acc = accuracy(test_model, val_loader, device)
+    print(f"Submitted plain-model validation clean accuracy: {submitted_clean_acc:.4f}")
+
+    if submitted_clean_acc <= 0.50:
+        raise RuntimeError(
+            "Saved plain model has <=50% clean validation accuracy. "
+            "Do not submit this checkpoint."
+        )
 
 
 if __name__ == "__main__":
