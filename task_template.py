@@ -550,6 +550,7 @@ def main():
                 state = copy.deepcopy(ema.shadow.backbone.state_dict())
             else:
                 state = copy.deepcopy(model.backbone.state_dict())
+            best_state = copy.deepcopy(state)
             torch.save(state, args.out)
             print(f"Saved best checkpoint to {args.out}")
 

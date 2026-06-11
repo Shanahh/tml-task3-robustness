@@ -46,9 +46,9 @@ Your submission will fail if:
 """
 
 BASE_URL = "http://34.63.153.158"
-API_KEY = "YOUR_API_KEY_HERE"  # replace with your actual API key
+API_KEY = "ef283bd434803248eee23a3b016499ae"  # replace with your actual API key
 
-MODEL_PATH = "PATH/TO/YOUR/MODEL.pt"  # replace with your actual model path
+MODEL_PATH = "/home/atml_team052/tml-task3-robustness/model.pt"  # replace with your actual model path
 MODEL_NAME = "resnet18"  # replace with your actual model architecture - resnet18, resnet34, or resnet50
 
 SUBMIT = True  # set to True to enable submission
